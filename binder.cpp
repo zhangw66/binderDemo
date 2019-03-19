@@ -41,6 +41,7 @@
 #include <binder/IPCThreadState.h>
 
 using namespace android;
+	class BpEventConnection;
 
 
 #define INFO(...) \
@@ -67,15 +68,44 @@ void assert_fail(const char *file, int line, const char *func, const char *expr)
 // Where to print the parcel contents: aout, alog, aerr. alog doesn't seem to work.
 #define PLOG aout
 
+class IEventConnection : public IInterface {
+    public:
+        enum {
+             ADD = IBinder::FIRST_CALL_TRANSACTION,
+        };
+        // Requests the service to perform an addition and return the result
+        virtual int32_t     add(int32_t v1, int32_t v2) = 0;
+        DECLARE_META_INTERFACE(EventConnection);  // Expands to 5 lines below:
+};
+class BpEventConnection : public BpInterface<IEventConnection> {
+public:
+	BpEventConnection(const sp<IBinder>& impl) : BpInterface<IEventConnection>(impl) {
+	    ALOGD("BpEventConnection::BpEventConnection()");
+	}
+	virtual int32_t add(int32_t v1, int32_t v2) {
+	    Parcel data, reply;
+	    data.writeInterfaceToken(IEventConnection::getInterfaceDescriptor());
+	    data.writeInt32(v1);
+	    data.writeInt32(v2);
+	    data.print(PLOG); endl(PLOG);
+	    remote()->transact(ADD, data, &reply);
+	    ALOGD("BpEventConnection::add transact reply");
+	    reply.print(PLOG); endl(PLOG);
+		int32_t res;
+	    status_t status = reply.readInt32(&res);
+	    ALOGD("BpEventConnection::add(%i, %i) = %i (status: %i)", v1, v2, res, status);
+	    return res;
+	}
+};
+IMPLEMENT_META_INTERFACE(EventConnection, "aservice");
 
-
-// Interface (our AIDL) - Shared by server and client
 class IDemo : public IInterface {
     public:
         enum {
             ALERT = IBinder::FIRST_CALL_TRANSACTION,
             PUSH,
-            ADD
+            ADD,
+            CREATE_CONNECTION,
         };
         // Sends a user-provided value to the service
         virtual void        push(int32_t data)          = 0;
@@ -83,7 +113,7 @@ class IDemo : public IInterface {
         virtual void        alert()                     = 0;
         // Requests the service to perform an addition and return the result
         virtual int32_t     add(int32_t v1, int32_t v2) = 0;
-
+		virtual sp<IEventConnection> createEventConnection() = 0;
         DECLARE_META_INTERFACE(Demo);  // Expands to 5 lines below:
         //static const android::String16 descriptor;
         //static android::sp<IDemo> asInterface(const android::sp<android::IBinder>& obj);
@@ -98,7 +128,15 @@ class BpDemo : public BpInterface<IDemo> {
         BpDemo(const sp<IBinder>& impl) : BpInterface<IDemo>(impl) {
             ALOGD("BpDemo::BpDemo()");
         }
-
+		virtual sp<IEventConnection> createEventConnection()
+	    {
+	    	ALOGD("BpDemo::createEventConnection()");
+	        Parcel data, reply;
+	        data.writeInterfaceToken(IDemo::getInterfaceDescriptor());
+	        remote()->transact(CREATE_CONNECTION, data, &reply);
+            //获得匿名服务的代理.
+	        return interface_cast<IEventConnection>(reply.readStrongBinder());
+	    }
         virtual void push(int32_t push_data) {
             Parcel data, reply;
             data.writeInterfaceToken(IDemo::getInterfaceDescriptor());
@@ -162,8 +200,44 @@ class BpDemo : public BpInterface<IDemo> {
     // End of macro expansion
 
 // Server
+class BnEventConnection : public BnInterface<IEventConnection> {
+    virtual status_t onTransact(uint32_t code, const Parcel& data, Parcel* reply, uint32_t flags = 0);
+};
+
+status_t BnEventConnection::onTransact(uint32_t code, const Parcel& data, Parcel* reply, uint32_t flags) {
+    ALOGD("BnEventConnection::onTransact(%i) %i", code, flags);
+    data.checkInterface(this);
+    data.print(PLOG); endl(PLOG);
+
+    switch(code) {
+        case ADD: {
+            int32_t inV1 = data.readInt32();
+            int32_t inV2 = data.readInt32();
+            int32_t sum = add(inV1, inV2);
+            ALOGD("BnDemo::onTransact add(%i, %i) = %i", inV1, inV2, sum);
+            ASSERT(reply != 0);
+            reply->print(PLOG); endl(PLOG);
+            reply->writeInt32(sum);
+            return NO_ERROR;
+        } break;
+        default:
+            return BBinder::onTransact(code, data, reply, flags);
+    }
+}
+
 class BnDemo : public BnInterface<IDemo> {
     virtual status_t onTransact(uint32_t code, const Parcel& data, Parcel* reply, uint32_t flags = 0);
+};
+
+class EventConnection;
+class EventConnection:public BnEventConnection  {
+    virtual int32_t add(int32_t v1, int32_t v2) {
+        INFO("EventConnection::add(%i, %i)", v1, v2);
+        return v1 + v2;
+    }
+public:
+	EventConnection(){ALOGD("%s:EventConnection()", __func__);}
+	virtual ~EventConnection(){ALOGD("%s:~EventConnection()", __func__);}
 };
 
 status_t BnDemo::onTransact(uint32_t code, const Parcel& data, Parcel* reply, uint32_t flags) {
@@ -194,10 +268,25 @@ status_t BnDemo::onTransact(uint32_t code, const Parcel& data, Parcel* reply, ui
             reply->writeInt32(sum);
             return NO_ERROR;
         } break;
+		case CREATE_CONNECTION: {
+			
+			sp<IEventConnection> pp = createEventConnection();
+			static sp<IEventConnection> fake = pp;
+			/*
+                这里的引用计数会在writeStrongBinder()中加1.
+				strong ref count will increment in writeStrongBinder
+				invoke sequence:
+				writeStrongBinder->flatten_binder->finish_flatten_binder->writeObject
+				acquire_object(ProcessState::self(), val, this);
+			*/
+            reply->writeStrongBinder(pp->asBinder());
+            return NO_ERROR;
+        } break;
         default:
             return BBinder::onTransact(code, data, reply, flags);
     }
 }
+
 
 class Demo : public BnDemo {
     virtual void push(int32_t data) {
@@ -210,7 +299,12 @@ class Demo : public BnDemo {
         INFO("Demo::add(%i, %i)", v1, v2);
         return v1 + v2;
     }
+	virtual sp<IEventConnection> createEventConnection() {
+		return new EventConnection();
+	}
 };
+	
+
 
 
 // Helper function to get a hold of the "Demo" service.
@@ -232,7 +326,7 @@ int main(int argc, char **argv) {
         ALOGD("We're the service");
 
         defaultServiceManager()->addService(String16("Demo"), new Demo());
-        android::ProcessState::self()->startThreadPool();
+        //android::ProcessState::self()->startThreadPool();
         ALOGD("Demo service is now ready");
         IPCThreadState::self()->joinThreadPool();
         ALOGD("Demo service thread joined");
@@ -242,11 +336,13 @@ int main(int argc, char **argv) {
         int v = atoi(argv[1]);
 
         sp<IDemo> demo = getDemoServ();
-        demo->alert();
-        demo->push(v);
-        const int32_t adder = 5;
-        int32_t sum = demo->add(v, adder);
-        ALOGD("Addition result: %i + %i = %i", v, adder, sum);
+        //demo->alert();
+        //demo->push(v);
+        //const int32_t adder = 5;
+        //int32_t sum = demo->add(v, adder);
+		//get 
+		sp<IEventConnection> connect= demo->createEventConnection();
+		connect->add(1, 2);
     }
 
     return 0;
